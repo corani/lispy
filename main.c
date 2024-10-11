@@ -360,6 +360,40 @@ lval* lval_copy(lval *v) {
     return x;
 }
 
+int lval_eq(lval* x, lval* y) {
+    if (x->Type != y->Type) return 0;
+
+    switch (x->Type) {
+        case LVAL_NUM: 
+            return x->Num == y->Num;
+
+        case LVAL_ERR: 
+            return strcmp(x->Err, y->Err) == 0;
+        case LVAL_SYM: 
+            return strcmp(x->Sym, y->Sym) == 0;
+
+        case LVAL_FUN: {
+            if (x->Builtin || y->Builtin) {
+                return x->Builtin == y->Builtin;
+            } else {
+                return lval_eq(x->Formals, y->Formals) && lval_eq(x->Body, y->Body);
+            }
+        }
+
+        case LVAL_SEXPR: case LVAL_QEXPR: {
+            if (x->Count != y->Count) return 0;
+
+            for (int i = 0; i < x->Count; i++) {
+                if (!lval_eq(x->Cell[i], y->Cell[i])) return 0;
+            }
+
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
 lval* lval_add(lval* v, lval* x) {
     v->Count++;
     v->Cell = realloc(v->Cell, sizeof(lval*) * v->Count);
@@ -521,11 +555,11 @@ lval* builtin_head(lenv* e, lval* a) {
     LASSERT(a, a->Cell[0]->Count != 0, 
         "Function 'head' passed {}");
 
-    lval* v = lval_take(a, 0);
+    lval* result = lval_take(a, 0);
 
-    while (v->Count > 1) lval_free(lval_pop(v, 1));
+    while (result->Count > 1) lval_free(lval_pop(result, 1));
 
-    return v;
+    return result;
 }
 
 lval* builtin_tail(lenv* e, lval* a) {
@@ -536,11 +570,11 @@ lval* builtin_tail(lenv* e, lval* a) {
     LASSERT(a, a->Cell[0]->Count != 0, 
         "Function 'head' passed {}");
 
-    lval* v = lval_take(a, 0);
+    lval* result = lval_take(a, 0);
 
-    lval_free(lval_pop(v, 0));
+    lval_free(lval_pop(result, 0));
 
-    return v;
+    return result;
 }
 
 lval* builtin_list(lenv* e, lval* a) {
@@ -646,35 +680,35 @@ lval* builtin_op(lenv* e, lval* a, char* op) {
         }
     }
 
-    lval* x = lval_pop(a, 0);
+    lval* result = lval_pop(a, 0);
 
     if ((strcmp(op, "-") == 0) && a->Count == 0) {
-        x->Num = -x->Num;
+        result->Num = -result->Num;
     }
 
     while (a->Count > 0) {
         lval* y = lval_pop(a, 0);
 
-        if (strcmp(op, "+") == 0) x->Num += y->Num;
-        if (strcmp(op, "-") == 0) x->Num -= y->Num;
-        if (strcmp(op, "*") == 0) x->Num *= y->Num;
+        if (strcmp(op, "+") == 0) result->Num += y->Num;
+        if (strcmp(op, "-") == 0) result->Num -= y->Num;
+        if (strcmp(op, "*") == 0) result->Num *= y->Num;
         if (strcmp(op, "/") == 0) {
             if (y->Num == 0) {
-                lval_free(x);
+                lval_free(result);
                 lval_free(y);
 
-                x = lval_err("Division by zero");
+                result = lval_err("Division by zero");
                 break;
             }
 
-            x->Num /= y->Num;
+            result->Num /= y->Num;
         }
 
         lval_free(y);
     }
 
     lval_free(a);
-    return x;
+    return result;
 }
 
 lval* builtin_add(lenv* e, lval* a) {
@@ -691,6 +725,95 @@ lval* builtin_mul(lenv* e, lval* a) {
 
 lval* builtin_div(lenv* e, lval* a) {
     return builtin_op(e, a, "/");
+}
+
+lval* builtin_ord(lenv* e, lval* a, char* op) {
+    (void)e;
+
+    LASSERT_COUNT(a, op, 2);
+    LASSERT_TYPE(a, op, 0, LVAL_NUM);
+    LASSERT_TYPE(a, op, 1, LVAL_NUM);
+
+    int result = 0;
+
+    if (strcmp(op, ">") == 0) {
+        result = a->Cell[0]->Num > a->Cell[1]->Num;
+    } else if (strcmp(op, "<") == 0) {
+        result = a->Cell[0]->Num < a->Cell[1]->Num;
+    } else if (strcmp(op, ">=") == 0) {
+        result = a->Cell[0]->Num >= a->Cell[1]->Num;
+    } else if (strcmp(op, "<=") == 0) {
+        result = a->Cell[0]->Num <= a->Cell[1]->Num;
+    }
+
+    lval_free(a);
+
+    return lval_num(result);
+}
+
+lval* builtin_gt(lenv* e, lval* a) {
+    return builtin_ord(e, a, ">");
+}
+
+lval* builtin_lt(lenv* e, lval* a) {
+    return builtin_ord(e, a, "<");
+}
+
+lval* builtin_ge(lenv* e, lval* a) {
+    return builtin_ord(e, a, ">=");
+}
+
+lval* builtin_le(lenv* e, lval* a) {
+    return builtin_ord(e, a, "<=");
+}
+
+lval* builtin_cmp(lenv* e, lval* a, char* op) {
+    (void)e;
+
+    LASSERT_COUNT(a, op, 2);
+
+    int result = 0;
+    
+    if (strcmp(op, "==") == 0) {
+        result = lval_eq(a->Cell[0], a->Cell[1]);
+    } else if (strcmp(op, "!=") == 0) {
+        result = !lval_eq(a->Cell[0], a->Cell[1]);
+    }
+
+    lval_free(a);
+
+    return lval_num(result);
+}
+
+lval* builtin_eq(lenv* e, lval* a) {
+    return builtin_cmp(e, a, "==");
+}
+
+lval* builtin_ne(lenv* e, lval* a) {
+    return builtin_cmp(e, a, "!=");
+}
+
+lval* builtin_if(lenv* e, lval* a) {
+    LASSERT_COUNT(a, "if", 3);
+    LASSERT_TYPE(a, "if", 0, LVAL_NUM);
+    LASSERT_TYPE(a, "if", 1, LVAL_QEXPR);
+    LASSERT_TYPE(a, "if", 2, LVAL_QEXPR);
+
+    // Turn both Q-Expression into S-Expression, so they can be evaluated. 
+    a->Cell[1]->Type = LVAL_SEXPR;
+    a->Cell[2]->Type = LVAL_SEXPR;
+
+    lval* result = NULL;
+
+    if (a->Cell[0]->Num) {
+        result = lval_eval(e, lval_pop(a, 1));
+    } else {
+        result = lval_eval(e, lval_pop(a, 2));
+    }
+
+    lval_free(a);
+
+    return result;
 }
 
 #undef LASSERT
@@ -712,6 +835,14 @@ void lenv_add_builtins(lenv* e) {
     lenv_add_builtin(e, "-", builtin_sub);
     lenv_add_builtin(e, "*", builtin_mul);
     lenv_add_builtin(e, "/", builtin_div);
+
+    lenv_add_builtin(e, "if", builtin_if);
+    lenv_add_builtin(e, "==", builtin_eq);
+    lenv_add_builtin(e, "!=", builtin_ne);
+    lenv_add_builtin(e, ">",  builtin_gt);
+    lenv_add_builtin(e, "<",  builtin_lt);
+    lenv_add_builtin(e, ">=", builtin_ge);
+    lenv_add_builtin(e, "<=", builtin_le);
 }
 
 void lenv_add_stdlib(lenv* env, mpc_parser_t* Lispy) {
@@ -719,6 +850,7 @@ void lenv_add_stdlib(lenv* env, mpc_parser_t* Lispy) {
         (def {fun} (\\ {args body} {def (head args) (\\ (tail args) body)}))    \
         (fun {unpack f xs} {eval (join (list f) xs)})                           \
         (fun {pack f & xs} {f xs})                                              \
+        (fun {len l} { if (== l {}) {0} {+ 1 (len (tail l))} })                 \
     ";
 
     mpc_result_t r;
