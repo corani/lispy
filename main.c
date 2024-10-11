@@ -31,6 +31,42 @@ void add_history(char* unused) { (void)unused; }
 
 #endif
 
+long eval_op(long x, char* op, long y) {
+    if (strcmp(op, "+") == 0) return x + y; 
+    if (strcmp(op, "-") == 0) return x - y;
+    if (strcmp(op, "*") == 0) return x * y;
+    if (strcmp(op, "/") == 0) return x / y;
+
+    return 0;
+}
+
+long eval(mpc_ast_t* t) {
+    // Base case: If tagged as number return it directly
+    if (strstr(t->tag, "number")) {
+        return atoi(t->contents);
+    }
+
+    // Skip the '('
+    int i = 1;
+
+    // The operator is always the second child
+    char* op = t->children[i++]->contents;
+
+    // Accumulator x, starting with the first operand (third child)
+    long result = eval(t->children[i++]);
+
+    if (strcmp(op, "-") == 0 && !strstr(t->children[i]->tag, "expr")) {
+        return -result;
+    }
+
+    // Iterate the remaining children and combine
+    while (strstr(t->children[i]->tag, "expr")) {
+        result = eval_op(result, op, eval(t->children[i++]));
+    }
+
+    return result;
+}
+
 int main(int argc, char** argv) {
     (void)argc;
     (void)argv;
@@ -66,6 +102,11 @@ int main(int argc, char** argv) {
         if (mpc_parse("<stdin>", input, Lispy, &r)) {
             // On success print the AST 
             mpc_ast_print(r.output);
+
+            // Evaluate the AST
+            long result = eval(r.output);
+            printf("result: %li\n", result);
+
             mpc_ast_delete(r.output);
         } else {
             mpc_err_print(r.error);
