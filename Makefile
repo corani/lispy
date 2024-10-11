@@ -4,5 +4,5 @@ LDFLAGS = -ledit
 
 all: lispy
 
-lispy: main.c
+lispy: main.c mpc/mpc.c
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
