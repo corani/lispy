@@ -36,6 +36,7 @@ typedef enum {
     LVAL_NUM,
     LVAL_SYM,
     LVAL_SEXPR,
+    LVAL_QEXPR,
 } lval_type;
 
 typedef struct lval {
@@ -99,6 +100,18 @@ lval* lval_sexpr(void) {
     return v;
 }
 
+lval* lval_qexpr(void) {
+    lval* v = malloc(sizeof(lval));
+
+    *v = (lval) {
+        .Type = LVAL_QEXPR,
+        .Count = 0,
+        .Cell = NULL,
+    };
+
+    return v;
+}
+
 void lval_free(lval* v) {
     switch (v->Type) {
         case LVAL_NUM: 
@@ -109,7 +122,7 @@ void lval_free(lval* v) {
         case LVAL_SYM: {
             free(v->Sym); 
         } break;
-        case LVAL_SEXPR: {
+        case LVAL_SEXPR: case LVAL_QEXPR: {
             for (int i = 0; i < v->Count; i++) {
                 lval_free(v->Cell[i]);
             }
@@ -146,11 +159,14 @@ lval* lval_read(mpc_ast_t* t) {
     lval* result = NULL;
     if (strcmp(t->tag, ">") == 0) result = lval_sexpr();
     if (strstr(t->tag, "sexpr"))  result = lval_sexpr();
+    if (strstr(t->tag, "qexpr"))  result = lval_qexpr();
 
     // Fill this list with any valid expression contained within
     for (int i = 0; i < t->children_num; i++) {
         if (strcmp(t->children[i]->contents, "(") == 0) continue;
         if (strcmp(t->children[i]->contents, ")") == 0) continue;
+        if (strcmp(t->children[i]->contents, "{") == 0) continue;
+        if (strcmp(t->children[i]->contents, "}") == 0) continue;
         if (strcmp(t->children[i]->tag,  "regex") == 0) continue;
 
         result = lval_add(result, lval_read(t->children[i]));
@@ -189,6 +205,9 @@ void lval_print(lval* v) {
         case LVAL_SEXPR: {
             lval_expr_print(v, '(', ')');
         } break;
+        case LVAL_QEXPR: {
+            lval_expr_print(v, '{', '}');
+        } break;
     }
 }
 
@@ -223,6 +242,86 @@ lval* lval_take(lval* v, int i) {
 
     return result;
 }
+
+lval* lval_join(lval* x, lval* y) {
+    while (y->Count) {
+        x = lval_add(x, lval_pop(y, 0));
+    }
+
+    lval_free(y);
+
+    return x; 
+}
+
+#define LASSERT(args, cond, err) \
+    if (!(cond)) { lval_free(args); return lval_err(err); }
+
+lval* builtin_head(lval* a) {
+    LASSERT(a, a->Count == 1,  
+        "Function 'head' passed too many arguments");
+    LASSERT(a, a->Cell[0]->Type == LVAL_QEXPR,
+        "Function 'head' passed incorrect type");
+    LASSERT(a, a->Cell[0]->Count != 0, 
+        "Function 'head' passed {}");
+
+    lval* v = lval_take(a, 0);
+
+    while (v->Count > 1) lval_free(lval_pop(v, 1));
+
+    return v;
+}
+
+lval* builtin_tail(lval* a) {
+    LASSERT(a, a->Count == 1,  
+        "Function 'head' passed too many arguments");
+    LASSERT(a, a->Cell[0]->Type == LVAL_QEXPR,
+        "Function 'head' passed incorrect type");
+    LASSERT(a, a->Cell[0]->Count != 0, 
+        "Function 'head' passed {}");
+
+    lval* v = lval_take(a, 0);
+
+    lval_free(lval_pop(v, 0));
+
+    return v;
+}
+
+lval* builtin_list(lval* a) {
+    a->Type = LVAL_QEXPR;
+
+    return a;
+}
+
+lval* builtin_eval(lval* v) {
+    LASSERT(v, v->Count == 1, 
+        "Function 'eval' passed too many arguments");
+    LASSERT(v, v->Cell[0]->Type == LVAL_QEXPR,
+        "Function 'eval' passed incorrect type");
+
+    lval* x = lval_take(v, 0);
+    x->Type = LVAL_SEXPR;
+
+    return lval_eval(x);
+}
+
+lval* builtin_join(lval* a) {
+    for (int i = 0; i < a->Count; i++) {
+        LASSERT(a, a->Cell[i]->Type == LVAL_QEXPR,
+            "Function 'join' passed incorrect type");
+    }
+
+    lval* result = lval_pop(a, 0);
+
+    while (a->Count) {
+        result = lval_join(result, lval_pop(a, 0));
+    }
+
+    lval_free(a);
+
+    return result;
+}
+
+#undef LASSERT
 
 lval* builtin_op(lval* a, char* op) {
     // Ensure all arguments are numbers
@@ -265,6 +364,19 @@ lval* builtin_op(lval* a, char* op) {
     return x;
 }
 
+lval* builtin(lval* a, char* func) {
+    if (strcmp("list", func) == 0) return builtin_list(a);
+    if (strcmp("head", func) == 0) return builtin_head(a);
+    if (strcmp("tail", func) == 0) return builtin_tail(a);
+    if (strcmp("join", func) == 0) return builtin_join(a);
+    if (strcmp("eval", func) == 0) return builtin_eval(a);
+    if (strstr("+-/*", func)) return builtin_op(a, func);
+
+    lval_free(a);
+
+    return lval_err("Unknown function");
+}
+
 lval* lval_eval_sexpr(lval* v) {
     // Recursively evaluate children
     for (int i = 0; i < v->Count; i++) {
@@ -292,7 +404,7 @@ lval* lval_eval_sexpr(lval* v) {
     }
 
     // Call builtin with operator
-    lval* result = builtin_op(v, f->Sym);
+    lval* result = builtin(v, f->Sym);
     lval_free(f);
 
     return result;
@@ -306,17 +418,20 @@ int main(int argc, char** argv) {
     mpc_parser_t* Number = mpc_new("number");
     mpc_parser_t* Symbol = mpc_new("symbol");
     mpc_parser_t* Sexpr  = mpc_new("sexpr");
+    mpc_parser_t* Qexpr  = mpc_new("qexpr");
     mpc_parser_t* Expr   = mpc_new("expr");
     mpc_parser_t* Lispy  = mpc_new("lispy");
 
     // Define the language
     mpca_lang(MPCA_LANG_DEFAULT, "                              \
             number : /-?[0-9]+/ ;                               \
-            symbol : '+' | '-' | '*' | '/' ;                    \
+            symbol : \"list\" | \"head\" | \"tail\" | \"join\"  \
+                   | \"eval\" | '+' | '-' | '*' | '/' ;         \
             sexpr  : '(' <expr>* ')' ;                          \
-            expr   : <number> | <symbol> | <sexpr> ;            \
+            qexpr  : '{' <expr>* '}' ;                          \
+            expr   : <number> | <symbol> | <sexpr> | <qexpr> ;  \
             lispy    : /^/ <expr>* /$/ ;                        \
-        ", Number, Symbol, Sexpr, Expr, Lispy);
+        ", Number, Symbol, Sexpr, Qexpr, Expr, Lispy);
 
     // Print version and exit information
     puts("Lispy Version 0.0.1");
@@ -354,7 +469,7 @@ int main(int argc, char** argv) {
         free(input);
     }
 
-    mpc_cleanup(5, Number, Symbol, Sexpr, Expr, Lispy);
+    mpc_cleanup(6, Number, Symbol, Sexpr, Qexpr, Expr, Lispy);
 
     return 0;
 }
