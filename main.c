@@ -31,19 +31,87 @@ void add_history(char* unused) { (void)unused; }
 
 #endif
 
-long eval_op(long x, char* op, long y) {
-    if (strcmp(op, "+") == 0) return x + y; 
-    if (strcmp(op, "-") == 0) return x - y;
-    if (strcmp(op, "*") == 0) return x * y;
-    if (strcmp(op, "/") == 0) return x / y;
+typedef enum {
+    LVAL_NUM,
+    LVAL_ERR,
+} lval_type;
 
-    return 0;
+typedef enum {
+    ERR_DIV_ZERO,
+    ERR_BAD_OP,
+    ERR_BAD_NUM,
+} err_type;
+
+typedef struct {
+    lval_type   Type;
+    long        Num;
+    err_type    Err;
+} lval;
+
+lval lval_num(long x) {
+    return (lval) { 
+        .Type = LVAL_NUM, 
+        .Num = x,
+    };
 }
 
-long eval(mpc_ast_t* t) {
+lval lval_err(err_type e) {
+    return (lval) {
+        .Type = LVAL_ERR,
+        .Err = e,
+    };
+}
+
+void lval_print(lval v) {
+    switch (v.Type) {
+        case LVAL_NUM: {
+            printf("%li", v.Num); 
+        } break;
+        case LVAL_ERR: {
+            switch (v.Err) {
+                case ERR_DIV_ZERO: {
+                    printf("Error: Division by zero"); 
+                } break;
+                case ERR_BAD_OP: {
+                    printf("Error: Invalid operator"); 
+                } break;
+                case ERR_BAD_NUM: {
+                    printf("Error: Invalid number"); 
+                } break;
+            }
+        } break;
+    }
+}
+
+void lval_println(lval v) {
+    lval_print(v);
+    putchar('\n');
+}
+
+lval eval_op(lval x, char* op, lval y) {
+    if (x.Type == LVAL_ERR) return x;
+    if (y.Type == LVAL_ERR) return y;
+
+    if (strcmp(op, "+") == 0) return lval_num(x.Num + y.Num); 
+    if (strcmp(op, "-") == 0) return lval_num(x.Num - y.Num);
+    if (strcmp(op, "*") == 0) return lval_num(x.Num * y.Num);
+
+    if (strcmp(op, "/") == 0) {
+        return y.Num == 0 
+            ? lval_err(ERR_DIV_ZERO) 
+            : lval_num(x.Num / y.Num);
+    }
+
+    return lval_err(ERR_BAD_OP);
+}
+
+lval eval(mpc_ast_t* t) {
     // Base case: If tagged as number return it directly
     if (strstr(t->tag, "number")) {
-        return atoi(t->contents);
+        errno = 0;
+        long x = strtol(t->contents, NULL, 10);
+
+        return errno != ERANGE ? lval_num(x) : lval_err(ERR_BAD_NUM);
     }
 
     // Skip the '('
@@ -53,10 +121,10 @@ long eval(mpc_ast_t* t) {
     char* op = t->children[i++]->contents;
 
     // Accumulator x, starting with the first operand (third child)
-    long result = eval(t->children[i++]);
+    lval result = eval(t->children[i++]);
 
     if (strcmp(op, "-") == 0 && !strstr(t->children[i]->tag, "expr")) {
-        return -result;
+        return lval_num(-result.Num);
     }
 
     // Iterate the remaining children and combine
@@ -104,8 +172,9 @@ int main(int argc, char** argv) {
             mpc_ast_print(r.output);
 
             // Evaluate the AST
-            long result = eval(r.output);
-            printf("result: %li\n", result);
+            lval result = eval(r.output);
+            printf("result: ");
+            lval_println(result);
 
             mpc_ast_delete(r.output);
         } else {
