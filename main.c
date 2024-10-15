@@ -1,7 +1,9 @@
+#include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
-
-#include "mpc/mpc.h"
+#include <stdarg.h>
+#include <stdbool.h>
+#include <errno.h>
 
 #ifdef _WIN32
 #include <string.h>
@@ -30,15 +32,6 @@ void add_history(char* unused) { (void)unused; }
 #include <editline/history.h>
 
 #endif
-
-mpc_parser_t* Number;
-mpc_parser_t* Symbol;
-mpc_parser_t* String;
-mpc_parser_t* Comment;
-mpc_parser_t* Sexpr;
-mpc_parser_t* Qexpr;
-mpc_parser_t* Expr;
-mpc_parser_t* Lispy;
 
 typedef enum {
     LVAL_ERR,
@@ -74,11 +67,13 @@ lval* lval_copy(lval *v);
 lval* lval_err(char* fmt, ...);
 lval* lval_sym(char* s);
 lval* lval_fun(char* s, lbuiltin fun);
+lval* lval_read_expr(char* s, int* i, char end);
 
 // NOTE(daniel): Syms and Vals are parallel arrays.
 struct lenv {
     lenv*   Parent;
-    int     Count;
+
+    size_t  Count;
     char**  Syms;
     lval**  Vals;
 };
@@ -99,7 +94,7 @@ struct lval {
     lval*           Body;
 
     // Expressions
-    int             Count;
+    size_t          Count;
     struct lval**   Cell;
 };
 
@@ -117,7 +112,7 @@ lenv* lenv_new(void) {
 }
 
 void lenv_free(lenv* e) {
-    for (int i = 0; i < e->Count; i++) {
+    for (size_t i = 0; i < e->Count; ++i) {
         free(e->Syms[i]);
         lval_free(e->Vals[i]);
     }
@@ -138,7 +133,7 @@ lenv* lenv_copy(lenv* e) {
         .Vals   = malloc(sizeof(lval*) * e->Count),
     };
 
-    for (int i = 0; i < e->Count; i++) {
+    for (size_t i = 0; i < e->Count; ++i) {
         n->Syms[i] = malloc(strlen(e->Syms[i]) + 1);
         strcpy(n->Syms[i], e->Syms[i]);
         n->Vals[i] = lval_copy(e->Vals[i]);
@@ -148,7 +143,7 @@ lenv* lenv_copy(lenv* e) {
 }
 
 lval* lenv_get(lenv* e, lval* k) {
-    for (int i = 0; i < e->Count; i++) {
+    for (size_t i = 0; i < e->Count; ++i) {
         if (strcmp(e->Syms[i], k->Sym) == 0) {
             return lval_copy(e->Vals[i]);
         }
@@ -163,7 +158,7 @@ lval* lenv_get(lenv* e, lval* k) {
 
 void lenv_put(lenv* e, lval* k, lval* v) {
     // NOTE(daniel): if the symbol already exists, free the old value and replace it.
-    for (int i = 0; i < e->Count; i++) {
+    for (size_t i = 0; i < e->Count; ++i) {
         if (strcmp(e->Syms[i], k->Sym) == 0) {
             lval_free(e->Vals[i]);
             e->Vals[i] = lval_copy(v);
@@ -173,7 +168,7 @@ void lenv_put(lenv* e, lval* k, lval* v) {
     }
 
     // NOTE(daniel): otherwise, create a new entry
-    e->Count++;
+    ++e->Count;
     e->Syms = realloc(e->Syms, sizeof(char*) * e->Count);
     e->Vals = realloc(e->Vals, sizeof(lval*) * e->Count);
 
@@ -336,7 +331,7 @@ void lval_free(lval* v) {
             free(v->Str);
         } break;
         case LVAL_SEXPR: case LVAL_QEXPR: {
-            for (int i = 0; i < v->Count; i++) {
+            for (size_t i = 0; i < v->Count; ++i) {
                 lval_free(v->Cell[i]);
             }
 
@@ -384,7 +379,7 @@ lval* lval_copy(lval *v) {
             x->Count = v->Count;
             x->Cell = malloc(sizeof(lval*) * x->Count);
 
-            for (int i = 0; i < x->Count; i++) {
+            for (size_t i = 0; i < x->Count; ++i) {
                 x->Cell[i] = lval_copy(v->Cell[i]);
             }
         } break;
@@ -418,7 +413,7 @@ int lval_eq(lval* x, lval* y) {
         case LVAL_SEXPR: case LVAL_QEXPR: {
             if (x->Count != y->Count) return 0;
 
-            for (int i = 0; i < x->Count; i++) {
+            for (size_t i = 0; i < x->Count; ++i) {
                 if (!lval_eq(x->Cell[i], y->Cell[i])) return 0;
             }
 
@@ -430,66 +425,17 @@ int lval_eq(lval* x, lval* y) {
 }
 
 lval* lval_add(lval* v, lval* x) {
-    v->Count++;
+    ++v->Count;
     v->Cell = realloc(v->Cell, sizeof(lval*) * v->Count);
     v->Cell[v->Count - 1] = x;
 
     return v;
 }
 
-lval* lval_read_num(mpc_ast_t* t) {
-    errno = 0;
-    long x = strtol(t->contents, NULL, 10);
-
-    return errno != ERANGE 
-        ? lval_num(x) 
-        : lval_err("invalid number");
-}
-
-lval* lval_read_str(mpc_ast_t* t) {
-    t->contents[strlen(t->contents)-1] = '\0';
-
-    char* unescaped = malloc(strlen(t->contents+1)+1);
-    strcpy(unescaped, t->contents+1);
-
-    unescaped = mpcf_unescape(unescaped);
-
-    lval* str = lval_str(unescaped);
-
-    free(unescaped);
-    return str;
-}
-
-lval* lval_read(mpc_ast_t* t) {
-    if (strstr(t->tag, "number")) return lval_read_num(t);
-    if (strstr(t->tag, "string")) return lval_read_str(t);
-    if (strstr(t->tag, "symbol")) return lval_sym(t->contents);
-
-    // If root (>) or sexpr create an empty list 
-    lval* result = NULL;
-    if (strcmp(t->tag, ">") == 0) result = lval_sexpr();
-    if (strstr(t->tag, "sexpr"))  result = lval_sexpr();
-    if (strstr(t->tag, "qexpr"))  result = lval_qexpr();
-
-    // Fill this list with any valid expression contained within
-    for (int i = 0; i < t->children_num; i++) {
-        if (strcmp(t->children[i]->contents, "(") == 0) continue;
-        if (strcmp(t->children[i]->contents, ")") == 0) continue;
-        if (strcmp(t->children[i]->contents, "{") == 0) continue;
-        if (strcmp(t->children[i]->contents, "}") == 0) continue;
-        if (strcmp(t->children[i]->tag,  "regex") == 0) continue;
-        if (strstr(t->children[i]->tag,"comment"))      continue;
-
-        result = lval_add(result, lval_read(t->children[i]));
-    }
-
-    return result;
-}
-
 void lval_expr_print(lval* v, char open, char close) {
     putchar(open);
 
-    for (int i = 0; i < v->Count; i++) {
+    for (size_t i = 0; i < v->Count; ++i) {
         lval_print(v->Cell[i]);
 
         if (i != (v->Count - 1)) {
@@ -500,14 +446,56 @@ void lval_expr_print(lval* v, char open, char close) {
     putchar(close);
 }
 
+// Possible unescapable characters 
+char* lval_str_unescapable = "abfnrtv\\\'\"";
+
+char lval_str_unescape(char x) {
+    switch (x) {
+        case 'a' : return '\a';
+        case 'b' : return '\b';
+        case 'f' : return '\f';
+        case 'n' : return '\n';
+        case 'r' : return '\r';
+        case 't' : return '\t';
+        case 'v' : return '\v';
+        case '\\': return '\\';
+        case '\'': return '\'';
+        case '\"': return '\"';
+        default  : return '\0';
+    }
+}
+
+// Possible escapable characters
+char* lval_str_escapable = "\a\b\f\n\r\t\v\\\'\"";
+
+char* lval_str_escape(char x) {
+    switch(x) {
+        case '\a': return "\\a";
+        case '\b': return "\\b";
+        case '\f': return "\\f";
+        case '\n': return "\\n";
+        case '\r': return "\\r";
+        case '\t': return "\\t";
+        case '\v': return "\\v";
+        case '\\': return "\\\\";
+        case '\'': return "\\\'";
+        case '\"': return "\\\"";
+        default  : return "";
+    }
+}
+
 void lval_str_print(lval* v) {
-    char* escaped = malloc(strlen(v->Str) + 1);
-    strcpy(escaped, v->Str);
-    escaped = mpcf_escape(escaped);
+    putchar('"');
 
-    printf("\"%s\"", escaped);
+    for (size_t i = 0; i < strlen(v->Str); ++i) {
+        if (strchr(lval_str_escapable, v->Str[i])) {
+            printf("%s", lval_str_escape(v->Str[i]));
+        } else {
+            putchar(v->Str[i]);
+        }
+    }
 
-    free(escaped);
+    putchar('"');
 }
 
 void lval_print(lval* v) {
@@ -662,7 +650,7 @@ lval* builtin_eval(lenv* e, lval* v) {
 lval* builtin_join(lenv* e, lval* a) {
     (void)e;
 
-    for (int i = 0; i < a->Count; i++) {
+    for (size_t i = 0; i < a->Count; ++i) {
         LASSERT_TYPE(a, "join", i, LVAL_QEXPR);
     }
 
@@ -682,7 +670,7 @@ lval* builtin_var(lenv* e, lval* a, char* fun) {
     
     lval* Syms = a->Cell[0];
 
-    for (int i = 0; i < Syms->Count; i++) {
+    for (size_t i = 0; i < Syms->Count; ++i) {
         LASSERT(a, (Syms->Cell[i]->Type == LVAL_SYM), 
             "Function 'def' cannot define non-symbol. Got %s, Expected %s.",
             lval_type_name(Syms->Cell[i]->Type), lval_type_name(LVAL_SYM));
@@ -692,7 +680,7 @@ lval* builtin_var(lenv* e, lval* a, char* fun) {
         "Function 'def' cannot define incorrect number of values. Got %i, Expected %i.",
         Syms->Count, a->Count-1);
 
-    for (int i = 0; i < Syms->Count; i++) {
+    for (size_t i = 0; i < Syms->Count; ++i) {
         if (strcmp(fun, "def") == 0) {
             lenv_def(e, Syms->Cell[i], a->Cell[i+1]);
         } else if (strcmp(fun, "=") == 0) {
@@ -720,7 +708,7 @@ lval* builtin_lambda(lenv* e, lval* a) {
     LASSERT_TYPE(a, "\\", 0, LVAL_QEXPR);
     LASSERT_TYPE(a, "\\", 1, LVAL_QEXPR);
 
-    for (int i = 0; i < a->Cell[0]->Count; i++) {
+    for (size_t i = 0; i < a->Cell[0]->Count; ++i) {
         LASSERT(a, (a->Cell[0]->Cell[i]->Type == LVAL_SYM), 
             "Cannot define non-symbol. Got %s, Expected %s.",
             lval_type_name(a->Cell[0]->Cell[i]->Type), lval_type_name(LVAL_SYM));
@@ -738,7 +726,7 @@ lval* builtin_op(lenv* e, lval* a, char* op) {
     (void)e;
 
     // Ensure all arguments are numbers
-    for (int i = 0; i < a->Count; i++) {
+    for (size_t i = 0; i < a->Count; ++i) {
         if (a->Cell[i]->Type != LVAL_NUM) {
             LASSERT_TYPE(a, op, i, LVAL_NUM);
         }
@@ -884,29 +872,40 @@ lval* builtin_load(lenv* e, lval* a) {
     LASSERT_COUNT(a, "load", 1);
     LASSERT_TYPE(a, "load", 0, LVAL_STR);
 
-    mpc_result_t result;
-    if (!mpc_parse_contents(a->Cell[0]->Str, Lispy, &result)) {
-        char* err_msg = mpc_err_string(result.error);
-        mpc_err_delete(result.error);
-
-        lval* err = lval_err("Could not load library %s", err_msg);
-        free(err_msg);
+    // Open file and check if exists 
+    FILE* f = fopen(a->Cell[0]->Str, "rb");
+    if (!f) {
+        lval* err = lval_err("Could not load library %s", a->Cell[0]->Str);
         lval_free(a);
 
-        return err;
+        return err; 
     }
 
-    lval* expr = lval_read(result.output);
-    mpc_ast_delete(result.output);
+    // Read file contents
+    fseek(f, 0, SEEK_END);
+    long length = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char* input = calloc(length+1, 1);
+    fread(input, 1, length, f);
+    fclose(f);
 
-    while (expr->Count) {
-        lval* x = lval_eval(e, lval_pop(expr, 0));
+    // Parse file
+    int pos = 0;
+    lval* expr = lval_read_expr(input, &pos, '\0');
+    free(input);
 
-        if (x->Type == LVAL_ERR) {
-            lval_println(x);
+    if (expr->Type != LVAL_ERR) {
+        while (expr->Count) {
+            lval* x = lval_eval(e, lval_pop(expr, 0));
+
+            if (x->Type == LVAL_ERR) {
+                lval_println(x);
+            }
+
+            lval_free(x);
         }
-
-        lval_free(x);
+    } else {
+        lval_println(expr);
     }
 
     lval_free(expr);
@@ -918,7 +917,7 @@ lval* builtin_load(lenv* e, lval* a) {
 lval* builtin_print(lenv* e, lval* a) {
     (void)e;
 
-    for (int i = 0; i < a->Count; i++) {
+    for (size_t i = 0; i < a->Count; ++i) {
         lval_print(a->Cell[i]);
         putchar(' ');
     }
@@ -1045,12 +1044,12 @@ lval* lval_call(lenv *e, lval* f, lval* a) {
 
 lval* lval_eval_sexpr(lenv* e, lval* v) {
     // Recursively evaluate children
-    for (int i = 0; i < v->Count; i++) {
+    for (size_t i = 0; i < v->Count; ++i) {
         v->Cell[i] = lval_eval(e, v->Cell[i]);
     }
 
     // Error checking
-    for (int i = 0; i < v->Count; i++) {
+    for (size_t i = 0; i < v->Count; ++i) {
         if (v->Cell[i]->Type == LVAL_ERR) return lval_take(v, i);
     }
 
@@ -1090,42 +1089,165 @@ void load_file(lenv* env, char* filename) {
     lval_free(x);
 }
 
+lval* lval_read(char* s, int* i);
+
+lval* lval_read_expr(char* s, int* i, char end) {
+    lval* x = (end == '}') ? lval_qexpr() : lval_sexpr();
+
+    while (s[*i] != end) {
+        lval* y = lval_read(s, i);
+
+        if (y->Type == LVAL_ERR) {
+            lval_free(x);
+
+            return y;
+        }
+
+        lval_add(x, y);
+    }
+
+    ++(*i);
+
+    return x;
+}
+
+char* lval_str_sym_characters = 
+    "abcdefghijklmnopqrstuvwxyz"
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    "0123456789"
+    "_+-*\\/=<>!&";
+
+lval* lval_read_sym(char* s, int* i) {
+    char* part = calloc(1, 1);
+
+    while (strchr(lval_str_sym_characters, s[*i]) && s[*i] != '\0') {
+        part = realloc(part, strlen(part) + 2);
+        part[strlen(part) + 0] = s[*i];
+        part[strlen(part) + 1] = '\0';
+        ++(*i);
+    }
+
+    // Check if identifier looks like a number
+    int is_num = strchr("-0123456789", part[0]) != NULL;
+    for (size_t i = 1; i < strlen(part); ++i) {
+        if (!strchr("0123456789", part[i])) {
+            is_num = 0;
+            break;
+        }
+    }
+    if (strlen(part) == 1 && part[0] == '-') is_num = 0;
+
+    lval* x = NULL;
+    if (is_num) {
+        errno = 0;
+        long num = strtol(part, NULL, 10);
+        x = (errno != ERANGE) ? lval_num(num) : lval_err("Invalid number");
+    } else {
+        x = lval_sym(part);
+    }
+
+    free(part);
+
+    return x;
+}
+
+lval* lval_read_str(char* s, int* i) {
+    // Skip the initial quote
+    ++(*i);
+
+    char* part = calloc(1, 1);
+    while (s[*i] != '"') {
+        char c = s[*i];
+
+        if (c == '\0') {
+            free(part);
+
+            return lval_err("Unexpected end of input");
+        }
+
+        // Read escape sequence
+        if (c == '\\') {
+            ++(*i);
+
+            if (strchr(lval_str_unescapable, s[*i])) {
+                c = lval_str_unescape(s[*i]);
+            } else {
+                free(part);
+
+                return lval_err("Invalid escape sequence \\%c", s[*i]);
+            }
+        }
+
+        // Append character to string
+        part = realloc(part, strlen(part) + 2);
+        part[strlen(part) + 0] = c;
+        part[strlen(part) + 1] = '\0';
+
+        ++(*i);
+    }
+
+    // Skip the final quote
+    ++(*i);
+
+    lval* x = lval_str(part);
+    free(part);
+
+    return x;
+}
+
+lval* lval_read(char* s, int* i) {
+    // Skip trailing whitespace and comments
+    while (strchr(" \t\v\r\n;", s[*i]) && s[*i] != '\0') {
+        if (s[*i] == ';') {
+            while (s[*i] != '\n' && s[*i] != '\0') ++(*i);
+        }
+
+        ++(*i);
+    }
+
+    lval* x = NULL;
+
+    if (s[*i] == '\0') return lval_err("Unexpected end of input");
+
+    if (s[*i] == '(') {
+        ++(*i);
+        x = lval_read_expr(s, i, ')');
+    } else if (s[*i] == '{') {
+        ++(*i);
+        x = lval_read_expr(s, i, '}');
+    } else if (strchr(lval_str_sym_characters, s[*i])) {
+        x = lval_read_sym(s, i);
+    } else if (strchr("\"", s[*i])) {
+        x = lval_read_str(s, i);
+    } else {
+        x = lval_err("Unexpected character %c", s[*i]);
+    }
+
+    // Skip trailing whitespace and comments
+    while (strchr(" \t\v\r\n;", s[*i]) && s[*i] != '\0') {
+        if (s[*i] == ';') {
+            while (s[*i] != '\n' && s[*i] != '\0') ++(*i);
+        }
+
+        ++(*i);
+    }
+
+    return x;
+}
+
 int main(int argc, char** argv) {
     (void)argc;
     (void)argv;
-
-    // Create some parsers
-    Number  = mpc_new("number");
-    Symbol  = mpc_new("symbol");
-    String  = mpc_new("string");
-    Comment = mpc_new("comment");
-    Sexpr   = mpc_new("sexpr");
-    Qexpr   = mpc_new("qexpr");
-    Expr    = mpc_new("expr");
-    Lispy   = mpc_new("lispy");
-
-    // Define the language
-    mpca_lang(MPCA_LANG_DEFAULT, "                              \
-            number  : /-?[0-9]+/ ;                              \
-            symbol  : /[a-zA-Z0-9_+\\-*\\/\\\\=<>!&]+/ ;        \
-            string  : /\"(\\\\.|[^\"])*\"/ ;                    \
-            comment : /;[^\\r\\n]*/ ;                           \
-            sexpr   : '(' <expr>* ')' ;                         \
-            qexpr   : '{' <expr>* '}' ;                         \
-            expr    : <number>  | <symbol> | <string>           \
-                    | <comment> | <sexpr>  | <qexpr> ;          \
-            lispy   : /^/ <expr>* /$/ ;                         \
-        ", Number, Symbol, String, Comment, Sexpr, Qexpr, Expr, Lispy);
-
-    // Print version and exit information
-    puts("Lispy Version 0.0.1");
-    puts("Press Ctrl+c to Exit\n");
 
     lenv* env = lenv_new();
     lenv_add_builtins(env);
     load_file(env, "stdlib.lisp");
 
     if (argc == 1) {
+        // Print version and exit information
+        puts("Lispy Version 0.0.1");
+        puts("Press Ctrl+c to Exit\n");
+
         // REPL
         for (;;) {
             // Output prompt and get input
@@ -1134,37 +1256,22 @@ int main(int argc, char** argv) {
             // Add input to history
             add_history(input);
 
-            // Attempt to parse the user input
-            mpc_result_t r;
-            if (mpc_parse("<stdin>", input, Lispy, &r)) {
-                // On success print the AST 
-                // mpc_ast_print(r.output);
+            // Read from input to create an S-Expression
+            int pos = 0;
+            lval* expr = lval_read_expr(input, &pos, '\0');
 
-                // Convert to s-expression
-                lval* result = lval_read(r.output);
-                lval_println(result);
-
-                // Evaluate the s-expression
-                result = lval_eval(env, result);
-                lval_println(result);
-
-                lval_free(result);
-                mpc_ast_delete(r.output);
-            } else {
-                mpc_err_print(r.error);
-                mpc_err_delete(r.error);
-            }
+            lval* result = lval_eval(env, expr);
+            lval_println(result);
+            lval_free(result);
 
             free(input);
         }
     } else {
         // Load files
-        for (int i = 1; i < argc; ++i) {
+        for (size_t i = 1; i < (size_t)argc; ++i) {
             load_file(env, argv[i]);
         }
     }
-
-    mpc_cleanup(8, Number, Symbol, String, Comment, Sexpr, Qexpr, Expr, Lispy);
 
     return 0;
 }
